@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs';
 import { config } from '../api/src/shared/config';
-import { closeDb, get, getDb, id, run, tx } from '../api/src/shared/db';
+import { closeDb, flushTurso, get, getDb, id, isTursoEnabled, resetTurso, run, tx } from '../api/src/shared/db';
 import { hashPassword } from '../api/src/shared/auth';
 import { destination, haversine, LatLng } from '../api/src/shared/geo';
 import { companiesRepo, plansRepo } from '../api/src/shared/repositories/companies';
@@ -29,8 +29,9 @@ const rand = () => {
 };
 const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
 
-function resetDb() {
+async function resetDb() {
   closeDb();
+  if (isTursoEnabled()) await resetTurso();
   const file = config.dbPath;
   for (const f of [file, `${file}-wal`, `${file}-shm`]) {
     try {
@@ -396,7 +397,7 @@ export async function seed(opts: { quiet?: boolean; deferReports?: boolean } = {
   const log = (...a: unknown[]) => !opts.quiet && console.log(...a);
   const t0 = Date.now();
   log(`🌱 Creando base de datos demo en ${config.dbPath}`);
-  resetDb();
+  await resetDb();
   const route = loadRoute();
 
   // --- Planes y empresas
@@ -814,6 +815,10 @@ export async function seed(opts: { quiet?: boolean; deferReports?: boolean } = {
   const counts = get<any>(
     `SELECT (SELECT COUNT(*) FROM positions) p, (SELECT COUNT(*) FROM trips) t, (SELECT COUNT(*) FROM alerts) a`,
   );
+  if (isTursoEnabled()) {
+    log(`??  Sincronizando datos con Turso Cloud (${config.tursoUrl})?`);
+    await flushTurso();
+  }
   closeDb();
   log(
     `✅ Seed listo en ${((Date.now() - t0) / 1000).toFixed(1)} s: ${counts.t} recorridos, ${counts.p} posiciones, ${counts.a} alertas.`,

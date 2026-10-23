@@ -48,8 +48,8 @@ const shimPlugin = {
         : undefined,
     );
     b.onResolve({ filter: /.*/ }, (args) => (alias[args.path] ? { path: alias[args.path] } : undefined));
-    // El runtime de Azure Functions solo se carga dentro del host de Azure: en el navegador no existe.
-    b.onResolve({ filter: /^@azure\/functions$/ }, () => ({ path: 'azure-functions', namespace: 'empty' }));
+    // El runtime de Azure Functions y el cliente de Turso solo se usan en Node, no en la demo del navegador.
+    b.onResolve({ filter: /^(@azure\/functions|@libsql\/client)$/ }, () => ({ path: 'empty-mod', namespace: 'empty' }));
     b.onLoad({ filter: /.*/, namespace: 'empty' }, () => ({ contents: 'export default {};', loader: 'js' }));
   },
 };

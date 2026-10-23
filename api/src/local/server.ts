@@ -6,6 +6,7 @@ process.env.WMS_LOCAL_ADAPTER = '1';
 import cors from 'cors';
 import express, { Request, Response } from 'express';
 import { config } from '../shared/config';
+import { isTursoEnabled, syncFromTurso } from '../shared/db';
 import { toErrorBody } from '../shared/errors';
 import { execute, HttpDef, registry, Req, resolveCtx, StreamDef } from '../shared/http';
 import '../index';
@@ -13,7 +14,7 @@ import '../index';
 const toExpressPath = (route: string) => '/api/' + route.replace(/\{(\w+)\}/g, ':$1');
 
 /** Rutas literales antes que las paramétricas (mismo criterio que el enrutador de Azure Functions). */
-const sortKey = (route: string) => route.replace(/\{\w+\}/g, '￿');
+const sortKey = (route: string) => route.replace(/\{\w+\}/g, '');
 
 function toReq(r: Request): Req {
   const url = new URL(r.originalUrl, 'http://localhost');
@@ -102,13 +103,20 @@ export function startTimers() {
 }
 
 if (require.main === module) {
-  const app = createApp();
-  app.listen(config.port, () => {
-    startTimers();
-    console.log(`\n🚚 WMS API (adaptador local de Azure Functions) en http://localhost:${config.port}/api`);
-    console.log(
-      `   ${registry.http.length} funciones HTTP · ${registry.stream.length} stream SSE · ${registry.timer.length} timer`,
-    );
-    console.log(`   Base de datos: ${config.dbPath}\n`);
-  });
+  (async () => {
+    if (isTursoEnabled()) {
+      await syncFromTurso().catch((err) => console.error('[Turso Init Sync]', err?.message ?? err));
+    }
+    const app = createApp();
+    app.listen(config.port, () => {
+      startTimers();
+      console.log(`\n🚚 WMS API (adaptador local de Azure Functions) en http://localhost:${config.port}/api`);
+      console.log(
+        `   ${registry.http.length} funciones HTTP · ${registry.stream.length} stream SSE · ${registry.timer.length} timer`,
+      );
+      console.log(
+        `   Base de datos: ${isTursoEnabled() ? `Turso Cloud (${config.tursoUrl}) + réplica ${config.dbPath}` : config.dbPath}\n`,
+      );
+    });
+  })();
 }

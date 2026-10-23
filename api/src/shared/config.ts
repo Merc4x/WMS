@@ -51,6 +51,12 @@ export const config = {
   get dbPath() {
     return resolveDbPath();
   },
+  get tursoUrl() {
+    return process.env.TURSO_DATABASE_URL ?? '';
+  },
+  get tursoAuthToken() {
+    return process.env.TURSO_AUTH_TOKEN ?? '';
+  },
   corsOrigin: (process.env.CORS_ORIGIN ?? 'http://localhost:4200').split(','),
   demoMode: (process.env.DEMO_MODE ?? 'true') !== 'false',
   timezone: 'America/Bogota',
