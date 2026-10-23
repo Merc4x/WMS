@@ -1,14 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
-import type { Client, InArgs, InStatement } from '@libsql/client';
 import { config } from './config';
 import { MIGRATIONS } from './migrations';
 
 /**
- * Capa de acceso a datos sobre SQLite (node:sqlite) con sincronización en la nube hacia Turso (libSQL).
- * Los repositorios sólo usan estas funciones síncronas (all/get/run/tx), manteniendo lecturas instantáneas
- * desde la réplica local y replicando todas las escrituras hacia Turso Cloud cuando está configurado.
+ * Capa de acceso a datos sobre SQLite (node:sqlite en Node / sql.js en navegador) con sincronización
+ * hacia Turso Cloud (libSQL HTTP /v2/pipeline).
+ * Los repositorios sólo usan las funciones síncronas (all/get/run/tx) sin ningún cambio.
  */
 type Param = string | number | bigint | null | Uint8Array | boolean | undefined;
 export type Params = Record<string, Param> | Param[];
@@ -17,50 +16,154 @@ let db: DatabaseSync | null = null;
 const cache = new Map<string, StatementSync>();
 const paramNames = new Map<string, string[]>();
 
-/* ---------- Cliente Turso (libSQL en la nube) ---------- */
-let tursoClient: Client | null = null;
+/* ---------- Cliente HTTP ligero para Turso Cloud (/v2/pipeline, compatible con Node y Navegador) ---------- */
+interface HranaValue {
+  type: 'null' | 'integer' | 'float' | 'text' | 'blob';
+  value?: string | number;
+  base64?: string;
+}
+
+interface HranaStmt {
+  sql: string;
+  args?: HranaValue[];
+  named_args?: { name: string; value: HranaValue }[];
+}
+
 let tursoSchemaReady: Promise<void> | null = null;
-let pendingWrites: InStatement[] = [];
-let txWrites: InStatement[] | null = null;
+let pendingWrites: HranaStmt[] = [];
+let txWrites: HranaStmt[] | null = null;
 let flushPromise: Promise<void> = Promise.resolve();
 let flushScheduled = false;
 let suppressTursoEcho = false;
+
+export function setTursoSuppress(v: boolean) {
+  suppressTursoEcho = v;
+}
+export function isTursoSuppressed(): boolean {
+  return suppressTursoEcho;
+}
 
 export function isTursoEnabled(): boolean {
   return Boolean(
     config.tursoUrl &&
       config.tursoAuthToken &&
-      config.dbPath !== ':memory:' &&
       !process.env.VITEST,
   );
 }
 
-function getTurso(): Client | null {
-  if (!isTursoEnabled()) return null;
-  if (!tursoClient) {
-    // Carga perezosa para no incluir @libsql/client cuando corre en el navegador (demo Pages)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createClient } = require('@libsql/client') as typeof import('@libsql/client');
-    tursoClient = createClient({
-      url: config.tursoUrl,
-      authToken: config.tursoAuthToken,
-    });
+function tursoPipelineUrl(): string {
+  return config.tursoUrl.replace(/^libsql:\/\//, 'https://').replace(/\/$/, '') + '/v2/pipeline';
+}
+
+function toBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') return Buffer.from(bytes).toString('base64');
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function fromBase64(b64: string): Uint8Array {
+  if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(b64, 'base64'));
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function toHranaValue(v: unknown): HranaValue {
+  if (v === null || v === undefined) return { type: 'null' };
+  if (typeof v === 'boolean') return { type: 'integer', value: v ? '1' : '0' };
+  if (typeof v === 'bigint') return { type: 'integer', value: String(v) };
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) return { type: 'null' };
+    return Number.isInteger(v) ? { type: 'integer', value: String(v) } : { type: 'float', value: v };
   }
-  return tursoClient;
+  if (v instanceof Uint8Array) return { type: 'blob', base64: toBase64(v) };
+  return { type: 'text', value: String(v) };
+}
+
+function toHranaStmt(sql: string, bound: unknown): HranaStmt {
+  if (bound === undefined) return { sql };
+  if (Array.isArray(bound)) return { sql, args: bound.map(toHranaValue) };
+  const named_args = Object.entries(bound as Record<string, unknown>).map(([name, val]) => ({
+    name: name.replace(/^@/, ''),
+    value: toHranaValue(val),
+  }));
+  return { sql, named_args };
+}
+
+function fromHranaCell(cell: HranaValue): unknown {
+  if (!cell || cell.type === 'null') return null;
+  if (cell.type === 'integer' || cell.type === 'float') return Number(cell.value);
+  if (cell.type === 'blob') return fromBase64(cell.base64 ?? '');
+  return cell.value ?? null;
+}
+
+async function tursoPipeline(stmts: HranaStmt[]): Promise<{ cols: string[]; rows: Record<string, unknown>[] }[]> {
+  if (!isTursoEnabled() || !stmts.length) return [];
+  const res = await fetch(tursoPipelineUrl(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.tursoAuthToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      requests: [
+        ...stmts.map((stmt) => ({ type: 'execute', stmt })),
+        { type: 'close' },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Turso HTTP ${res.status}: ${await res.text()}`);
+  }
+  const data = (await res.json()) as {
+    results: {
+      type: 'ok' | 'error';
+      error?: { message: string };
+      response?: {
+        type: string;
+        result?: { cols: { name: string }[]; rows: HranaValue[][] };
+      };
+    }[];
+  };
+  const out: { cols: string[]; rows: Record<string, unknown>[] }[] = [];
+  for (const r of data.results) {
+    if (r.type === 'error') throw new Error(`Turso SQL error: ${r.error?.message ?? 'unknown'}`);
+    if (r.response?.type === 'execute' && r.response.result) {
+      const cols = r.response.result.cols.map((c) => c.name);
+      const rows = r.response.result.rows.map((row) => {
+        const obj: Record<string, unknown> = {};
+        for (let i = 0; i < cols.length; i++) obj[cols[i]] = fromHranaCell(row[i]);
+        return obj;
+      });
+      out.push({ cols, rows });
+    }
+  }
+  return out;
+}
+
+function splitSqlStatements(sqlBlock: string): HranaStmt[] {
+  return sqlBlock
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map((sql) => ({ sql }));
 }
 
 async function ensureTursoSchema(): Promise<void> {
-  const client = getTurso();
-  if (!client) return;
+  if (!isTursoEnabled()) return;
   if (!tursoSchemaReady) {
     tursoSchemaReady = (async () => {
-      await client.execute('CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER NOT NULL)');
-      const r = await client.execute('SELECT COALESCE(MAX(version), 0) AS v FROM _schema_version');
-      const current = Number(r.rows[0]?.v ?? 0);
+      await tursoPipeline([{ sql: 'CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER NOT NULL)' }]);
+      const [r] = await tursoPipeline([{ sql: 'SELECT COALESCE(MAX(version), 0) AS v FROM _schema_version' }]);
+      const current = Number(r?.rows[0]?.v ?? 0);
       for (let v = current; v < MIGRATIONS.length; v++) {
-        await client.executeMultiple(
-          `${MIGRATIONS[v]}\nINSERT INTO _schema_version (version) VALUES (${v + 1});`,
-        );
+        const stmts = [
+          ...splitSqlStatements(MIGRATIONS[v]),
+          { sql: `INSERT INTO _schema_version (version) VALUES (${v + 1})` },
+        ];
+        await tursoPipeline(stmts);
       }
     })();
   }
@@ -76,17 +179,16 @@ function scheduleTursoFlush() {
   });
 }
 
-/** Envía todas las escrituras pendientes a Turso Cloud en lotes transaccionales. */
+/** Envía todas las escrituras pendientes a Turso Cloud en lotes. */
 export function flushTurso(): Promise<void> {
-  const client = getTurso();
-  if (!client || !pendingWrites.length) return flushPromise;
+  if (!isTursoEnabled() || !pendingWrites.length) return flushPromise;
   const batch = pendingWrites.splice(0, pendingWrites.length);
   flushPromise = flushPromise
     .then(async () => {
       await ensureTursoSchema();
       const CHUNK = 120;
       for (let i = 0; i < batch.length; i += CHUNK) {
-        await client.batch(batch.slice(i, i + CHUNK), 'write');
+        await tursoPipeline(batch.slice(i, i + CHUNK));
       }
     })
     .catch((err) => {
@@ -97,17 +199,20 @@ export function flushTurso(): Promise<void> {
 
 /** Reinicia las tablas remotas en Turso Cloud (usado por `npm run seed`). */
 export async function resetTurso(): Promise<void> {
-  const client = getTurso();
-  if (!client) return;
+  if (!isTursoEnabled()) return;
   pendingWrites = [];
   txWrites = null;
   tursoSchemaReady = null;
-  const tablesRes = await client.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-  );
-  const drops = tablesRes.rows.map((r) => `DROP TABLE IF EXISTS "${String(r.name)}";`).join('\n');
-  if (drops) {
-    await client.executeMultiple(`PRAGMA foreign_keys = OFF;\n${drops}\nPRAGMA foreign_keys = ON;`);
+  const [tablesRes] = await tursoPipeline([
+    { sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'" },
+  ]);
+  if (tablesRes?.rows.length) {
+    const drops: HranaStmt[] = [
+      { sql: 'PRAGMA foreign_keys = OFF' },
+      ...tablesRes.rows.map((r) => ({ sql: `DROP TABLE IF EXISTS "${String(r.name)}"` })),
+      { sql: 'PRAGMA foreign_keys = ON' },
+    ];
+    await tursoPipeline(drops);
   }
   await ensureTursoSchema();
 }
@@ -141,44 +246,56 @@ const SYNC_TABLES = [
   'driver_locations',
 ];
 
+/** Tablas ligeras de negocio que la demo del navegador sincroniza periódicamente con Turso Cloud. */
+export const LIVE_SYNC_TABLES = [
+  'plans',
+  'companies',
+  'subscriptions',
+  'invoices',
+  'users',
+  'driver_profiles',
+  'devices',
+  'vehicles',
+  'geofences',
+  'geofence_vehicles',
+  'alert_rules',
+  'alerts',
+  'tickets',
+  'ticket_comments',
+  'driver_locations',
+];
+
 /**
- * Descarga el estado actual desde Turso Cloud hacia la réplica SQLite local.
+ * Descarga las tablas indicadas desde Turso Cloud hacia la réplica SQLite local.
  * Devuelve `true` si Turso Cloud ya tenía datos, o `false` si está vacía.
  */
-export async function syncFromTurso(): Promise<boolean> {
-  const client = getTurso();
-  if (!client) return false;
+export async function syncFromTurso(tables: string[] = SYNC_TABLES): Promise<boolean> {
+  if (!isTursoEnabled()) return false;
   await ensureTursoSchema();
-  const countRes = await client.execute('SELECT COUNT(*) AS n FROM companies');
-  const remoteCount = Number(countRes.rows[0]?.n ?? 0);
+  const [countRes] = await tursoPipeline([{ sql: 'SELECT COUNT(*) AS n FROM companies' }]);
+  const remoteCount = Number(countRes?.rows[0]?.n ?? 0);
   if (remoteCount === 0) return false;
 
   const d = getDb();
-  const results = await client.batch(
-    SYNC_TABLES.map((t) => `SELECT * FROM ${t}`),
-    'read',
-  );
+  const results = await tursoPipeline(tables.map((t) => ({ sql: `SELECT * FROM ${t}` })));
 
+  const prevSuppress = suppressTursoEcho;
   suppressTursoEcho = true;
   try {
     d.exec('PRAGMA foreign_keys = OFF; BEGIN;');
     try {
-      for (const t of [...SYNC_TABLES].reverse()) {
+      for (const t of [...tables].reverse()) {
         d.exec(`DELETE FROM ${t}`);
       }
-      for (let idx = 0; idx < SYNC_TABLES.length; idx++) {
-        const table = SYNC_TABLES[idx];
+      for (let idx = 0; idx < tables.length; idx++) {
+        const table = tables[idx];
         const rs = results[idx];
         if (!rs || !rs.rows.length) continue;
-        const cols = rs.columns;
+        const cols = rs.cols;
         const placeholders = cols.map(() => '?').join(',');
         const ins = d.prepare(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`);
         for (const row of rs.rows) {
-          const vals = cols.map((c) => {
-            const v = (row as any)[c];
-            if (v instanceof ArrayBuffer) return new Uint8Array(v);
-            return v ?? null;
-          });
+          const vals = cols.map((c) => norm(row[c] as Param));
           ins.run(...vals);
         }
       }
@@ -188,7 +305,7 @@ export async function syncFromTurso(): Promise<boolean> {
       throw e;
     }
   } finally {
-    suppressTursoEcho = false;
+    suppressTursoEcho = prevSuppress;
   }
   return true;
 }
@@ -282,7 +399,7 @@ export function run(sql: string, params?: Params): { changes: number } {
   const r = p === undefined ? s.run() : Array.isArray(p) ? s.run(...p) : s.run(p);
 
   if (isTursoEnabled() && !suppressTursoEcho) {
-    const entry: InStatement = p === undefined ? sql : { sql, args: p as InArgs };
+    const entry = toHranaStmt(sql, p);
     if (txWrites) {
       txWrites.push(entry);
     } else {
@@ -300,7 +417,7 @@ export function tx<T>(fn: () => T): T {
   if (txDepth > 0) return fn();
   d.exec('BEGIN');
   txDepth++;
-  const localTxQueue: InStatement[] = [];
+  const localTxQueue: HranaStmt[] = [];
   if (isTursoEnabled() && !suppressTursoEcho) txWrites = localTxQueue;
   try {
     const out = fn();

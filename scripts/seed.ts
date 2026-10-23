@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs';
 import { config } from '../api/src/shared/config';
-import { closeDb, flushTurso, get, getDb, id, isTursoEnabled, resetTurso, run, tx } from '../api/src/shared/db';
+import { closeDb, flushTurso, get, getDb, id, isTursoEnabled, isTursoSuppressed, resetTurso, run, tx } from '../api/src/shared/db';
 import { hashPassword } from '../api/src/shared/auth';
 import { destination, haversine, LatLng } from '../api/src/shared/geo';
 import { companiesRepo, plansRepo } from '../api/src/shared/repositories/companies';
@@ -31,7 +31,7 @@ const pick = <T>(arr: T[]) => arr[Math.floor(rand() * arr.length)];
 
 async function resetDb() {
   closeDb();
-  if (isTursoEnabled()) await resetTurso();
+  if (isTursoEnabled() && !isTursoSuppressed()) await resetTurso();
   const file = config.dbPath;
   for (const f of [file, `${file}-wal`, `${file}-shm`]) {
     try {
@@ -815,7 +815,7 @@ export async function seed(opts: { quiet?: boolean; deferReports?: boolean } = {
   const counts = get<any>(
     `SELECT (SELECT COUNT(*) FROM positions) p, (SELECT COUNT(*) FROM trips) t, (SELECT COUNT(*) FROM alerts) a`,
   );
-  if (isTursoEnabled()) {
+  if (isTursoEnabled() && !isTursoSuppressed()) {
     log(`??  Sincronizando datos con Turso Cloud (${config.tursoUrl})?`);
     await flushTurso();
   }

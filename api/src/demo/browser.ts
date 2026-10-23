@@ -91,6 +91,8 @@ export async function boot(opts: BootOptions): Promise<DemoApi> {
   if (fresh) g.__WMS_DB_BYTES = saved!.bytes;
 
   // Importar la API registra todas las funciones y abre la base (aplica migraciones si hace falta).
+  const { setTursoSuppress, syncFromTurso, flushTurso, LIVE_SYNC_TABLES } = await import('../shared/db');
+  setTursoSuppress(true);
   const { registry, execute } = await import('../shared/http');
   await import('../index');
   let seededAt = fresh ? (saved!.seededAt ?? saved!.at) : Date.now();
@@ -128,7 +130,8 @@ export async function boot(opts: BootOptions): Promise<DemoApi> {
   async function handle(method: string, url: string, headers: Record<string, string>, body: unknown): Promise<DemoResponse> {
     const u = new URL(url, 'http://demo.local');
     const m = method.toUpperCase();
-    if (m !== 'GET' && !/\/(tracking\/ingest|simulator\/heartbeat)$/.test(u.pathname)) schedulePersist();
+    const isUserMutation = m !== 'GET' && !/\/(tracking\/ingest|simulator\/heartbeat)$/.test(u.pathname);
+    if (isUserMutation) schedulePersist();
     for (const r of routes) {
       if (!r.def.methods.includes(m)) continue;
       const hit = r.re.exec(u.pathname);
@@ -136,7 +139,9 @@ export async function boot(opts: BootOptions): Promise<DemoApi> {
       const params: Record<string, string> = {};
       r.names.forEach((n, i) => (params[n] = decodeURIComponent(hit[i + 1])));
       const h = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
-      const out = await execute(r.def, {
+      if (isUserMutation) setTursoSuppress(false);
+      try {
+        const out = await execute(r.def, {
         method: m,
         path: u.pathname,
         params,
@@ -145,7 +150,11 @@ export async function boot(opts: BootOptions): Promise<DemoApi> {
         body: body ?? {},
         ip: 'navegador',
       });
-      return { status: out.status, headers: out.headers, json: out.json, body: out.body };
+        if (isUserMutation) void flushTurso();
+        return { status: out.status, headers: out.headers, json: out.json, body: out.body };
+      } finally {
+        if (isUserMutation) setTursoSuppress(true);
+      }
     }
     if (u.pathname === '/api/health') return { status: 200, headers: {}, json: { status: 'ok', runtime: 'browser-demo' } };
     return { status: 404, headers: {}, json: { code: 'NOT_FOUND', message: 'Ruta no encontrada.' } };
@@ -182,6 +191,8 @@ export async function boot(opts: BootOptions): Promise<DemoApi> {
     if (db) idbSet(DB_KEY, { tag: SCHEMA_TAG, at: Date.now(), seededAt, bytes: db.export() });
   }
   if (!fresh) persist();
+  syncFromTurso(LIVE_SYNC_TABLES).then((ok) => ok && persist()).catch(() => {});
+  setInterval(() => syncFromTurso(LIVE_SYNC_TABLES).catch(() => {}), 6000);
   // Los reportes de ejemplo (PDF y Excel) se generan unos segundos después del arranque: así la primera
   // visita no descarga ni ejecuta ExcelJS y PDFKit antes de poder iniciar sesión.
   if (sampleReports) {

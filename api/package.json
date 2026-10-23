@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@azure/functions": "^4.16.5",
-    "@libsql/client": "^0.18.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "exceljs": "^4.4.0",

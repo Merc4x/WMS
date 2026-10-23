@@ -40,6 +40,10 @@ function resolveDbPath(): string {
     : path.join(API_ROOT, raw);
 }
 
+const DEFAULT_TURSO_URL = 'libsql://wms-merc4x.aws-us-east-1.turso.io';
+const DEFAULT_TURSO_TOKEN =
+  'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTI3MTU4NDYsImlkIjoiMDFhMTY2MzAtMWEwMS03YjE0LTljYzItOTRlZmRlOWM4OGIyIiwia2lkIjoiOWpBcUdLVkhyLTQwZFhVMHFTTGgzeXpDdVV6NEppQ3FCeUp0Y0tXMGdRcyIsInJpZCI6ImM1ZWJlM2NhLTVhMmMtNDk5My04MTNkLThiZmE2ZGY3MDNmNSJ9.kU41Sm23YoQDW4W5ATU-jnPY4PWZadKwGo8GXWnMX5guIn-day2TfpItTFk4Lf2WFIBm7jamBgVqr2b5IZZbDQ';
+
 export const config = {
   port: Number(process.env.PORT ?? 7071),
   jwtSecret: process.env.JWT_SECRET ?? 'wms-dev-secret-cambiar',
@@ -52,10 +56,10 @@ export const config = {
     return resolveDbPath();
   },
   get tursoUrl() {
-    return process.env.TURSO_DATABASE_URL ?? '';
+    return process.env.TURSO_DATABASE_URL ?? DEFAULT_TURSO_URL;
   },
   get tursoAuthToken() {
-    return process.env.TURSO_AUTH_TOKEN ?? '';
+    return process.env.TURSO_AUTH_TOKEN ?? DEFAULT_TURSO_TOKEN;
   },
   corsOrigin: (process.env.CORS_ORIGIN ?? 'http://localhost:4200').split(','),
   demoMode: (process.env.DEMO_MODE ?? 'true') !== 'false',

@@ -14,7 +14,7 @@ import '../index';
 const toExpressPath = (route: string) => '/api/' + route.replace(/\{(\w+)\}/g, ':$1');
 
 /** Rutas literales antes que las paramétricas (mismo criterio que el enrutador de Azure Functions). */
-const sortKey = (route: string) => route.replace(/\{\w+\}/g, '');
+const sortKey = (route: string) => route.replace(/\{\w+\}/g, '\ufffd');
 
 function toReq(r: Request): Req {
   const url = new URL(r.originalUrl, 'http://localhost');
